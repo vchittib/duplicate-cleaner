@@ -1,36 +1,22 @@
-import os
-import hashlib
+import argparse
 from collections import defaultdict
 from pathlib import Path
 
-SCAN_DIR = Path(r"C:\Users\vishu\Downloads")
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress
+
+from utils import format_size, HashCache
+
+console = Console()
 
 
-def format_size(num_bytes):
-    for unit in ("B", "KB", "MB", "GB"):
-        if num_bytes < 1024:
-            return f"{num_bytes:.1f} {unit}"
-        num_bytes /= 1024
-    return f"{num_bytes:.1f} TB"
-
-
-def hash_file(path, chunk_size=65536):
-    h = hashlib.sha256()
-    try:
-        with open(path, "rb") as f:
-            while chunk := f.read(chunk_size):
-                h.update(chunk)
-        return h.hexdigest()
-    except (PermissionError, OSError):
-        return None
-
-
-def find_duplicates(folder):
-    # Step 1: group files by size (fast pre-filter — different sizes can't be duplicates)
+def find_duplicates(folder, cache):
+    """Return dict mapping SHA-256 hash -> list of duplicate Paths."""
     size_groups = defaultdict(list)
     total_files = 0
 
-    print(f"Scanning: {folder}\n")
+    console.print(f"[bold]Scanning:[/bold] {folder}\n")
 
     for entry in folder.rglob("*"):
         if entry.is_file():
@@ -40,67 +26,83 @@ def find_duplicates(folder):
             except (PermissionError, OSError):
                 pass
 
-    print(f"Found {total_files} files. Checking for duplicates...\n")
-
-    # Step 2: hash only files that share a size
-    hash_groups = defaultdict(list)
     candidates = [files for files in size_groups.values() if len(files) > 1]
     candidate_count = sum(len(f) for f in candidates)
 
-    checked = 0
-    for files in candidates:
-        for path in files:
-            digest = hash_file(path)
-            if digest:
-                hash_groups[digest].append(path)
-            checked += 1
-            print(f"\r  Hashing files: {checked}/{candidate_count}", end="", flush=True)
+    console.print(f"Found [cyan]{total_files}[/cyan] files. "
+                  f"Hashing [cyan]{candidate_count}[/cyan] candidates...\n")
 
-    if candidate_count:
-        print()  # newline after progress
+    hash_groups = defaultdict(list)
 
-    # Step 3: keep only groups with more than one file
-    duplicates = {h: paths for h, paths in hash_groups.items() if len(paths) > 1}
-    return duplicates
+    with Progress(console=console) as progress:
+        task = progress.add_task("Hashing files", total=candidate_count)
+        for files in candidates:
+            for path in files:
+                digest = cache.get(path)
+                if digest:
+                    hash_groups[digest].append(path)
+                progress.advance(task)
+
+    return {h: paths for h, paths in hash_groups.items() if len(paths) > 1}
 
 
 def main():
-    if not SCAN_DIR.exists():
-        print(f"Error: folder not found: {SCAN_DIR}")
+    parser = argparse.ArgumentParser(description="Find duplicate files in a directory.")
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=str(Path.home() / "Downloads"),
+        help="Directory to scan (default: ~/Downloads)",
+    )
+    args = parser.parse_args()
+
+    scan_dir = Path(args.directory).resolve()
+    if not scan_dir.exists():
+        console.print(f"[red]Error:[/red] folder not found: {scan_dir}")
         return
 
-    duplicates = find_duplicates(SCAN_DIR)
+    cache = HashCache(scan_dir)
+    try:
+        duplicates = find_duplicates(scan_dir, cache)
+    finally:
+        cache.close()
 
     if not duplicates:
-        print("\nNo duplicate files found.")
+        console.print("\n[green]No duplicate files found.[/green]")
         return
 
-    total_groups = len(duplicates)
     total_wasted = 0
 
-    print(f"\n{'='*60}")
-    print(f"  Found {total_groups} group{'s' if total_groups != 1 else ''} of duplicate files")
-    print(f"{'='*60}\n")
+    table = Table(title="Duplicate Files", show_lines=True)
+    table.add_column("Group", justify="right", style="bold")
+    table.add_column("Size", style="cyan")
+    table.add_column("Copies", justify="right")
+    table.add_column("Wasted", style="red")
+    table.add_column("Files")
 
     for i, (digest, paths) in enumerate(duplicates.items(), 1):
         size = paths[0].stat().st_size
         wasted = size * (len(paths) - 1)
         total_wasted += wasted
 
-        print(f"Group {i}  —  {format_size(size)} each  "
-              f"({len(paths)} copies, {format_size(wasted)} wasted)")
-        print(f"  Hash: {digest[:16]}...")
+        sorted_paths = sorted(paths, key=lambda p: len(str(p)))
+        file_list = ""
+        for j, path in enumerate(sorted_paths):
+            marker = "[green]KEEP?[/green]" if j == 0 else "[red]DUPE?[/red]"
+            file_list += f"{marker}  {path}\n"
 
-        # Sort: shortest path first (likely the "original")
-        for j, path in enumerate(sorted(paths, key=lambda p: len(str(p)))):
-            marker = "  KEEP?  " if j == 0 else "  DUPE?  "
-            print(f"{marker} {path}")
-        print()
+        table.add_row(
+            str(i),
+            format_size(size),
+            str(len(paths)),
+            format_size(wasted),
+            file_list.strip(),
+        )
 
-    print(f"{'='*60}")
-    print(f"  Total reclaimable space: {format_size(total_wasted)}")
-    print(f"{'='*60}")
-    print("\nNothing was deleted. Review the list above and remove duplicates manually.")
+    console.print()
+    console.print(table)
+    console.print(f"\n[bold]Total reclaimable space:[/bold] [red]{format_size(total_wasted)}[/red]")
+    console.print("\n[dim]Nothing was deleted. Review the list above and remove duplicates manually.[/dim]")
 
 
 if __name__ == "__main__":
